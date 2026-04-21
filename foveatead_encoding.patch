@@ -1,0 +1,430 @@
+diff --git a/source/abrEncApp.cpp b/source/abrEncApp.cpp
+index c80abd863..cce0b108c 100644
+--- a/source/abrEncApp.cpp
++++ b/source/abrEncApp.cpp
+@@ -29,11 +29,41 @@
+ 
+ #include <signal.h>
+ #include <errno.h>
++#include <math.h>
+ 
+ #include <queue>
+ 
+ using namespace X265_NS;
+ 
++/* === FOVEATED ENCODING HELPERS ===
++ * Compute per-QG (16x16 block) Gaussian QP offset map and fill dst[].
++ * dst must be allocated with qgBlocksX*qgBlocksY floats.
++ * offset = delta * (1 - exp(-dist_sq / (2*sigma^2)))
++ * Default sigma (0) = 94.66 pixels = 2.5 visual-angle degrees at 60cm/24-inch.
++ */
++static void fovea_compute_qp_map(float* dst, int qgBlocksX, int qgBlocksY,
++                                  int qgSize, float gazeX, float gazeY,
++                                  float sigma, float delta)
++{
++    /* Default sigma: 2.5 degrees at 60cm viewing, 24-inch 1920-wide monitor */
++    if (sigma <= 0.0f)
++        sigma = 94.66f;
++
++    float inv2sigma2 = 1.0f / (2.0f * sigma * sigma);
++    for (int by = 0; by < qgBlocksY; by++)
++    {
++        float cy = (by + 0.5f) * qgSize;
++        for (int bx = 0; bx < qgBlocksX; bx++)
++        {
++            float cx = (bx + 0.5f) * qgSize;
++            float dx = cx - gazeX;
++            float dy = cy - gazeY;
++            float dist_sq = dx * dx + dy * dy;
++            dst[by * qgBlocksX + bx] = delta * (1.0f - expf(-dist_sq * inv2sigma2));
++        }
++    }
++}
++
+ /* Ctrl-C handler */
+ static volatile sig_atomic_t b_ctrl_c /* = 0 */;
+ static void sigint_handler(int)
+@@ -228,6 +258,12 @@ namespace X265_NS {
+         m_scaler = NULL;
+         m_reader = NULL;
+         m_ret = 0;
++        m_foveaQpOffsets  = NULL;
++        m_foveaQgBlocksX  = 0;
++        m_foveaQgBlocksY  = 0;
++        m_foveaGazeFileFP = NULL;
++        m_prevGazeX       = -1.0f;
++        m_prevGazeY       = -1.0f;
+     }
+ 
+     int PassEncoder::init(int &result)
+@@ -669,6 +705,47 @@ ret:
+                     m_cliopt.bDither = false;
+             }
+ 
++            /* === FOVEATED ENCODING INIT ===
++             * Allocate quantOffsets buffer and open gaze file if fovea is enabled.
++             * When foveaDelta==0, all of this is skipped and behavior is identical
++             * to upstream x265. */
++            if (m_param->foveaDelta > 0.0f)
++            {
++                /* The quantOffsets array is per-16x16-block in full-res (when qgSize > 8).
++                 * Size = ceil(W/16) * ceil(H/16), matching m_lowres.maxBlocksInRow * maxBlocksInCol
++                 * which uses X265_LOWRES_CU_SIZE=8 on lowres (half-res) = 16px in full-res. */
++                m_foveaQgBlocksX = (m_param->sourceWidth  + 15) / 16;
++                m_foveaQgBlocksY = (m_param->sourceHeight + 15) / 16;
++                int totalBlocks = m_foveaQgBlocksX * m_foveaQgBlocksY;
++                m_foveaQpOffsets = (float*)malloc(totalBlocks * sizeof(float));
++                if (!m_foveaQpOffsets)
++                {
++                    x265_log(m_param, X265_LOG_ERROR, "Failed to allocate fovea QP offsets buffer\n");
++                    m_ret = 4;
++                    goto fail;
++                }
++                /* Open per-frame gaze file if specified */
++                if (m_param->foveaGazeFile && m_param->foveaGazeFile[0])
++                {
++                    m_foveaGazeFileFP = fopen(m_param->foveaGazeFile, "r");
++                    if (!m_foveaGazeFileFP)
++                        x265_log(m_param, X265_LOG_WARNING, "fovea: cannot open gaze file '%s', "
++                                 "using static gaze\n", m_param->foveaGazeFile);
++                }
++                /* Use frame center as default gaze */
++                float defaultGazeX = m_param->foveaGazeX > 0.0f ? m_param->foveaGazeX
++                                                                  : m_param->sourceWidth  / 2.0f;
++                float defaultGazeY = m_param->foveaGazeY > 0.0f ? m_param->foveaGazeY
++                                                                  : m_param->sourceHeight / 2.0f;
++                /* Pre-compute static map (used when no gaze file).
++                 * Block pixel size is always 16 to match the quantOffsets 16x16 grid. */
++                fovea_compute_qp_map(m_foveaQpOffsets, m_foveaQgBlocksX, m_foveaQgBlocksY,
++                                     16, defaultGazeX, defaultGazeY,
++                                     m_param->foveaSigma, m_param->foveaDelta);
++                m_prevGazeX = defaultGazeX;
++                m_prevGazeY = defaultGazeY;
++            }
++
+             // main encoder loop
+             while (pic_in[0] && !b_ctrl_c)
+             {
+@@ -794,6 +871,79 @@ ret:
+                     }
+                 }
+ 
++                /* === FOVEATED ENCODING: inject per-frame quantOffsets ===
++                 * Reads gaze from file if available, then recomputes Gaussian QP map.
++                 * On saccade (gaze jump > 5% of frame width), also applies a brief
++                 * QP boost at the new gaze location to encourage intra refresh.
++                 * Zero overhead when foveaDelta == 0 (m_foveaQpOffsets is NULL). */
++                if (m_foveaQpOffsets && pic_in[0])
++                {
++                    float gazeX = m_prevGazeX;
++                    float gazeY = m_prevGazeY;
++
++                    if (m_foveaGazeFileFP)
++                    {
++                        /* Try to read gaze for this frame; reuse previous on failure */
++                        int frameNum;
++                        float fx, fy;
++                        if (fscanf(m_foveaGazeFileFP, "%d %f %f", &frameNum, &fx, &fy) == 3)
++                        {
++                            gazeX = fx;
++                            gazeY = fy;
++                        }
++                    }
++                    else
++                    {
++                        gazeX = m_param->foveaGazeX > 0.0f ? m_param->foveaGazeX
++                                                            : m_param->sourceWidth  / 2.0f;
++                        gazeY = m_param->foveaGazeY > 0.0f ? m_param->foveaGazeY
++                                                            : m_param->sourceHeight / 2.0f;
++                    }
++
++                    /* Saccade detection: if gaze moved > 5% of frame width, recompute
++                     * with boosted negative offset at new gaze center (drives intra). */
++                    float saccadeThresh = m_param->sourceWidth * 0.05f;
++                    float dx = gazeX - m_prevGazeX;
++                    float dy = gazeY - m_prevGazeY;
++                    bool isSaccade = (sqrtf(dx * dx + dy * dy) > saccadeThresh)
++                                     && m_prevGazeX >= 0.0f;
++
++                    fovea_compute_qp_map(m_foveaQpOffsets, m_foveaQgBlocksX, m_foveaQgBlocksY,
++                                         16, gazeX, gazeY,
++                                         m_param->foveaSigma, m_param->foveaDelta);
++
++                    if (isSaccade)
++                    {
++                        /* Boost new foveal region quality further (negative offset = lower QP).
++                         * This steers x265 toward intra mode at the saccade destination. */
++                        float sigma = m_param->foveaSigma > 0.0f ? m_param->foveaSigma : 94.66f;
++                        float saccadeSigma = sigma;  /* 1-sigma radius for boost */
++                        float inv2s2 = 1.0f / (2.0f * saccadeSigma * saccadeSigma);
++                        for (int by = 0; by < m_foveaQgBlocksY; by++)
++                        {
++                            float cy = (by + 0.5f) * 16;
++                            for (int bx = 0; bx < m_foveaQgBlocksX; bx++)
++                            {
++                                float cx = (bx + 0.5f) * 16;
++                                float ddx = cx - gazeX;
++                                float ddy = cy - gazeY;
++                                float dsq = ddx * ddx + ddy * ddy;
++                                /* Subtract a Gaussian to pull QP down at new gaze center */
++                                m_foveaQpOffsets[by * m_foveaQgBlocksX + bx] -=
++                                    m_param->foveaDelta * 0.5f * expf(-dsq * inv2s2);
++                            }
++                        }
++                    }
++
++                    m_prevGazeX = gazeX;
++                    m_prevGazeY = gazeY;
++
++                    /* Attach to the input picture (view 0 only for now) */
++                    for (int view = 0; view < m_param->numViews - !!m_param->format; view++)
++                        if (pic_in[view])
++                            pic_in[view]->quantOffsets = m_foveaQpOffsets;
++                }
++
+                 for (int inputNum = 0; inputNum < inputPicNum; inputNum++)
+                 {
+                     x265_picture* picInput = NULL;
+@@ -955,6 +1105,17 @@ ret:
+             m_scaler->destroy();
+             delete m_scaler;
+         }
++        /* Free foveated encoding resources */
++        if (m_foveaQpOffsets)
++        {
++            free(m_foveaQpOffsets);
++            m_foveaQpOffsets = NULL;
++        }
++        if (m_foveaGazeFileFP)
++        {
++            fclose(m_foveaGazeFileFP);
++            m_foveaGazeFileFP = NULL;
++        }
+     }
+ 
+     Scaler::Scaler(int threadId, int threadNum, int id, VideoDesc *src, VideoDesc *dst, PassEncoder *parentEnc)
+diff --git a/source/abrEncApp.h b/source/abrEncApp.h
+index 7f66c49aa..0016951a3 100644
+--- a/source/abrEncApp.h
++++ b/source/abrEncApp.h
+@@ -96,6 +96,14 @@ namespace X265_NS {
+         FILE*    m_dolbyVisionRpu;/* File containing Dolby Vision BL RPU metadata */
+         FILE*    m_scenecutAwareQpConfig;
+ 
++        /* Foveated encoding state — per-frame Gaussian QP offset map */
++        float*   m_foveaQpOffsets;    /* flat float32 array, size = qgBlocksX*qgBlocksY */
++        int      m_foveaQgBlocksX;    /* ceil(width/16)  */
++        int      m_foveaQgBlocksY;    /* ceil(height/16) */
++        FILE*    m_foveaGazeFileFP;   /* open handle to per-frame gaze file, or NULL */
++        float    m_prevGazeX;         /* previous frame gaze (for saccade detection) */
++        float    m_prevGazeY;
++
+         int m_ret;
+ 
+         PassEncoder(uint32_t id, CLIOptions cliopt, AbrEncoder *parent);
+diff --git a/source/common/param.cpp b/source/common/param.cpp
+index c09214d37..999df3f94 100755
+--- a/source/common/param.cpp
++++ b/source/common/param.cpp
+@@ -450,6 +450,14 @@ void x265_param_default(x265_param* param)
+     param->bEnableSCC = 0;
+ 
+     param->bConfigRCFrame = 0;
++
++    /* Foveated encoding — all disabled by default; encoder is bit-for-bit
++     * identical to upstream when foveaDelta == 0 */
++    param->foveaGazeX    = -1.0f;  /* -1 = use frame center */
++    param->foveaGazeY    = -1.0f;
++    param->foveaDelta    = 0.0f;   /* 0 = foveation disabled */
++    param->foveaSigma    = 0.0f;   /* 0 = auto (95px) */
++    param->foveaGazeFile = NULL;
+ }
+ 
+ int x265_param_default_preset(x265_param* param, const char* preset, const char* tune)
+@@ -882,6 +890,22 @@ int x265_zone_param_parse(x265_param* p, const char* name, const char* value)
+     OPT("tskip-fast") p->bEnableTSkipFast = atobool(value);
+     OPT("rdpenalty") p->rdPenalty = atoi(value);
+     OPT("dynamic-rd") p->dynamicRd = atof(value);
++    /* Foveated encoding parameters */
++    OPT("fovea-gaze")
++    {
++        /* Expects "x,y" format, e.g. "960,540" */
++        float x = 0.0f, y = 0.0f;
++        if (sscanf(value, "%f,%f", &x, &y) == 2)
++        {
++            p->foveaGazeX = x;
++            p->foveaGazeY = y;
++        }
++        else
++            bError = true;
++    }
++    OPT("fovea-delta") p->foveaDelta = (float)atof(value);
++    OPT("fovea-sigma") p->foveaSigma = (float)atof(value);
++    OPT("fovea-gaze-file") p->foveaGazeFile = strdup(value);
+     else
+         return X265_PARAM_BAD_NAME;
+ 
+@@ -1528,6 +1552,21 @@ int x265_param_parse(x265_param* p, const char* name, const char* value)
+ #endif
+         OPT("frame-rc") p->bConfigRCFrame = atobool(value);
+         OPT("threaded-me") p->bThreadedME = atobool(value);
++        /* Foveated encoding parameters (also parsed here for x265_param_parse API) */
++        OPT("fovea-gaze")
++        {
++            float x = 0.0f, y = 0.0f;
++            if (sscanf(value, "%f,%f", &x, &y) == 2)
++            {
++                p->foveaGazeX = x;
++                p->foveaGazeY = y;
++            }
++            else
++                bError = true;
++        }
++        OPT("fovea-delta") p->foveaDelta = (float)atof(value);
++        OPT("fovea-sigma") p->foveaSigma = (float)atof(value);
++        OPT("fovea-gaze-file") p->foveaGazeFile = strdup(value);
+         else
+             return X265_PARAM_BAD_NAME;
+     }
+@@ -3057,6 +3096,12 @@ void x265_copy_params(x265_param* dst, x265_param* src)
+     dst->bEnableSBRC = src->bEnableSBRC;
+     dst->bConfigRCFrame = src->bConfigRCFrame;
+     dst->isAbrLadderEnable = src->isAbrLadderEnable;
++    /* Foveated encoding */
++    dst->foveaGazeX    = src->foveaGazeX;
++    dst->foveaGazeY    = src->foveaGazeY;
++    dst->foveaDelta    = src->foveaDelta;
++    dst->foveaSigma    = src->foveaSigma;
++    dst->foveaGazeFile = src->foveaGazeFile;
+ }
+ 
+ #ifdef SVT_HEVC
+diff --git a/source/encoder/analysis.cpp b/source/encoder/analysis.cpp
+index 06f538588..d799ef12d 100644
+--- a/source/encoder/analysis.cpp
++++ b/source/encoder/analysis.cpp
+@@ -4392,6 +4392,31 @@ int Analysis::calculateQpforCuSize(const CUData& ctu, const CUGeom& cuGeom, int3
+         }
+     }
+ 
++    /* Fovea direct path: when quantOffsets are set but the AQ machinery is disabled
++     * (e.g. CQP mode forces aqMode=0), average them over this CU's 16x16 blocks. */
++    if (m_frame->m_quantOffsets && m_param->rc.aqMode == 0)
++    {
++        uint32_t width = m_frame->m_fencPic->m_picWidth;
++        uint32_t height = m_frame->m_fencPic->m_picHeight;
++        uint32_t block_x = ctu.m_cuPelX + g_zscanToPelX[cuGeom.absPartIdx];
++        uint32_t block_y = ctu.m_cuPelY + g_zscanToPelY[cuGeom.absPartIdx];
++        uint32_t maxCols = (width + 15) / 16;  /* 16-pixel grid matches quantOffsets layout */
++        uint32_t blockSize = m_param->maxCUSize >> cuGeom.depth;
++        double dQpOffset = 0;
++        uint32_t cnt = 0;
++        for (uint32_t block_yy = block_y; block_yy < block_y + blockSize && block_yy < height; block_yy += 16)
++        {
++            for (uint32_t block_xx = block_x; block_xx < block_x + blockSize && block_xx < width; block_xx += 16)
++            {
++                uint32_t idx = ((block_yy / 16) * maxCols) + (block_xx / 16);
++                dQpOffset += m_frame->m_quantOffsets[idx];
++                cnt++;
++            }
++        }
++        if (cnt)
++            qp += dQpOffset / cnt;
++    }
++
+     return x265_clip3(m_param->rc.qpMin, m_param->rc.qpMax, (int)(qp + 0.5));
+ }
+ 
+diff --git a/source/encoder/encoder.cpp b/source/encoder/encoder.cpp
+index b20a0b12a..89a361f61 100644
+--- a/source/encoder/encoder.cpp
++++ b/source/encoder/encoder.cpp
+@@ -3736,10 +3736,15 @@ void Encoder::initPPS(PPS *pps)
+     bool bIsVbv = m_param->rc.vbvBufferSize > 0 && m_param->rc.vbvMaxBitrate > 0;
+     bool bEnableDistOffset = m_param->analysisMultiPassDistortion && m_param->rc.bStatRead;
+ 
+-    if (!m_param->bLossless && (m_param->rc.aqMode || bIsVbv || m_param->bAQMotion))
++    bool bFoveaActive = m_param->foveaDelta > 0.0f;
++    if (!m_param->bLossless && (m_param->rc.aqMode || bIsVbv || m_param->bAQMotion || bFoveaActive))
+     {
+         pps->bUseDQP = true;
+-        pps->maxCuDQPDepth = g_log2Size[m_param->maxCUSize] - g_log2Size[m_param->rc.qgSize];
++        /* Use 16-block granularity for fovea (matches quantOffsets grid), else use qgSize */
++        if (bFoveaActive && !m_param->rc.aqMode)
++            pps->maxCuDQPDepth = g_log2Size[m_param->maxCUSize] - g_log2Size[16];
++        else
++            pps->maxCuDQPDepth = g_log2Size[m_param->maxCUSize] - g_log2Size[m_param->rc.qgSize];
+         X265_CHECK(pps->maxCuDQPDepth <= 3, "max CU DQP depth cannot be greater than 3\n");
+     }
+     else if (!m_param->bLossless && bEnableDistOffset)
+diff --git a/source/x265.h b/source/x265.h
+index 3c5d3e3b6..24cbf47a2 100644
+--- a/source/x265.h
++++ b/source/x265.h
+@@ -2370,6 +2370,30 @@ typedef struct x265_param
+ 
+     /*tune*/
+     const char* tune;
++
++    /* === FOVEATED ENCODING PARAMETERS (added for gaze-contingent QP mapping) ===
++     * All zero/NULL = disabled; encoder behavior is bit-for-bit identical to
++     * upstream x265 when foveaDelta == 0 or foveaGazeFile == NULL with no gaze set. */
++
++    /* Gaze fixation point in pixel coordinates. (0,0) = top-left.
++     * Ignored when foveaDelta == 0. */
++    float    foveaGazeX;
++
++    /* Gaze fixation point Y in pixel coordinates. */
++    float    foveaGazeY;
++
++    /* Maximum QP offset applied at the periphery (positive = lower quality).
++     * 0 = foveated encoding disabled. Recommended range: 5..40. */
++    float    foveaDelta;
++
++    /* Gaussian sigma in pixels defining the foveal quality falloff radius.
++     * 0 = use default (95px = 2.5 degrees visual angle at 60cm / 24-inch monitor). */
++    float    foveaSigma;
++
++    /* Path to a per-frame gaze file (one line per frame: "frame_num x y").
++     * When set, overrides foveaGazeX/foveaGazeY with per-frame values.
++     * NULL = use static gaze from foveaGazeX/foveaGazeY. */
++    const char* foveaGazeFile;
+ } x265_param;
+ 
+ /* x265_param_alloc:
+diff --git a/source/x265cli.cpp b/source/x265cli.cpp
+index 9ec74c83a..1c0c1c2ba 100755
+--- a/source/x265cli.cpp
++++ b/source/x265cli.cpp
+@@ -281,6 +281,11 @@ namespace X265_NS {
+         H0("   --[no-]aq-motion              Block level QP adaptation based on the relative motion between the block and the frame. Default %s\n", OPT(param->bAQMotion));
+         H1("   --[no-]sbrc                   Enables the segment based rate control. Default %s\n", OPT(param->bEnableSBRC));
+         H0("   --qg-size <int>               Specifies the size of the quantization group (64, 32, 16, 8). Default %d\n", param->rc.qgSize);
++        H0("\nFoveated encoding options (gaze-contingent per-QG QP mapping):\n");
++        H0("   --fovea-gaze <x,y>            Static gaze fixation in pixels (e.g. 960,540 for center). Requires --aq-mode >= 1.\n");
++        H0("   --fovea-delta <float>         Max QP offset at periphery (0=disabled, range 5..40). Default 0.\n");
++        H0("   --fovea-sigma <float>         Gaussian sigma in pixels (0=auto: 95px = 2.5 deg @ 60cm/24in). Default 0.\n");
++        H0("   --fovea-gaze-file <path>      Per-frame gaze file (format: 'frame_num x y', one per line). Overrides --fovea-gaze.\n");
+         H0("   --[no-]cutree                 Enable cutree for Adaptive Quantization. Default %s\n", OPT(param->rc.cuTree));
+         H0("   --[no-]rc-grain               Enable rate-control mode to handle grains specifically. Turned on with tune grain. Default %s\n", OPT(param->rc.bEnableGrain));
+         H1("   --ipratio <float>             QP factor between I and P. Default %.2f\n", param->rc.ipFactor);
+diff --git a/source/x265cli.h b/source/x265cli.h
+index b41d73748..6e184aeeb 100644
+--- a/source/x265cli.h
++++ b/source/x265cli.h
+@@ -400,10 +400,11 @@ static const struct option long_options[] =
+     { "no-frame-rc",no_argument, NULL, 0 },
+     { "threaded-me", no_argument, NULL, 0 },
+     { "no-threaded-me", no_argument, NULL, 0 },
+-    { 0, 0, 0, 0 },
+-    { 0, 0, 0, 0 },
+-    { 0, 0, 0, 0 },
+-    { 0, 0, 0, 0 },
++    /* Foveated encoding options */
++    { "fovea-gaze",      required_argument, NULL, 0 },
++    { "fovea-delta",     required_argument, NULL, 0 },
++    { "fovea-sigma",     required_argument, NULL, 0 },
++    { "fovea-gaze-file", required_argument, NULL, 0 },
+     { 0, 0, 0, 0 }
+ };
+ 

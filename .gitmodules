@@ -1,0 +1,3 @@
+[submodule "x265_src"]
+	path = x265_src
+	url = https://bitbucket.org/multicoreware/x265_git
